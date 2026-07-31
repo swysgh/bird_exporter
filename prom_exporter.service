@@ -1,0 +1,23 @@
+[Unit]
+Description=Prometheus Exporter for BIRD Routing Protocol (BGP + Babel)
+Documentation=https://github.com/swysgh/bird_exporter
+After=network.target bird.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /zfspool/share/nas/code/bird_exporter/bird_exporter.py 8000
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+StartLimitInterval=60
+StartLimitStartBurst=3
+
+# 安全限制
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run/bird
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
