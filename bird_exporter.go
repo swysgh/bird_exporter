@@ -19,6 +19,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/subtle"
 	"flag"
 	"fmt"
 	"log"
@@ -44,13 +45,21 @@ var (
 )
 
 // bearerAuthMiddleware 包装一个 HTTP Handler，要求请求携带正确的 Bearer Token。
+// 使用 constant-time 比较防止时序侧信道攻击。
 func bearerAuthMiddleware(token string, next http.Handler) http.Handler {
 	if token == "" {
 		return next
 	}
+	tokenBytes := []byte(token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") || auth[7:] != token {
+		if !strings.HasPrefix(auth, "Bearer ") {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="metrics"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		provided := []byte(auth[7:])
+		if subtle.ConstantTimeCompare(provided, tokenBytes) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="metrics"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -414,8 +423,11 @@ func (c *birdCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	// ---- Babel ----
-	babelOutput, err := runBirdc("show babel neighbors babel1")
-	if err == nil {
+	// 使用通用查询（不指定协议名），兼容所有 Babel 实例命名
+	babelOutput, err := runBirdc("show babel neighbors")
+	if err != nil {
+		log.Printf("Babel 邻居查询失败: %v", err)
+	} else {
 		for _, n := range parseBabelNeighbors(babelOutput) {
 			ch <- prometheus.MustNewConstMetric(c.babelRTTDesc, prometheus.GaugeValue,
 				n.rttMs, n.ip, n.interfaceName)
@@ -453,7 +465,15 @@ func main() {
 	} else {
 		log.Println("未启用认证")
 	}
-	if err := http.ListenAndServe(*listenAddr, nil); err != nil {
+	// 使用带有超时设置的 HTTP Server，防止慢连接耗尽 goroutine
+	srv := &http.Server{
+		Addr:              *listenAddr,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
