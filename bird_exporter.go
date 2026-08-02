@@ -284,14 +284,15 @@ func parseRouteChangeDataLine(line string) [5]int {
 		vals[i] = -1 // 默认不可用
 	}
 	fields := strings.Fields(line)
-	// fields[0] 是标签，fields[1:] 是数据列
+	// 取最后 5 个字段作为数据列，避免标签（如 "Import updates:"）被拆成多个词导致偏移
 	if len(fields) < 6 {
 		return vals
 	}
-	for i := 0; i < 5 && i+1 < len(fields); i++ {
-		if fields[i+1] == "---" {
+	dataFields := fields[len(fields)-5:]
+	for i := 0; i < 5; i++ {
+		if dataFields[i] == "---" {
 			vals[i] = -1
-		} else if n, err := strconv.Atoi(fields[i+1]); err == nil {
+		} else if n, err := strconv.Atoi(dataFields[i]); err == nil {
 			vals[i] = n
 		}
 	}
