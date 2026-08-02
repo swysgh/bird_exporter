@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -138,8 +139,44 @@ func runBirdc(command string) (string, error) {
 }
 
 // ---------------------------------------------------------------------------
-// BGP 协议解析
+// 正则表达式（BIRD 协议解析）
 // ---------------------------------------------------------------------------
+
+var (
+	// bgpSummaryRe 匹配 BGP 协议摘要行："<name> BGP --- ..."
+	// 例："bgp1    BGP ---        up     00:01:23    Established"
+	bgpSummaryRe = regexp.MustCompile(`^(\S+)\s+BGP\s+---`)
+
+	// bgpStateRe 从 "BGP state: <state>" 行提取会话状态。
+	bgpStateRe = regexp.MustCompile(`^BGP state:\s*(.+)$`)
+
+	// bgpFieldRe 匹配 "Neighbor AS:" 或 "Local AS:" 行，捕获组 1 = 字段名，组 2 = 数值。
+	bgpFieldRe = regexp.MustCompile(`^(Neighbor AS|Local AS):\s*(\d+)`)
+
+	// bgpChannelRe 匹配通道标记行，如 "Channel ipv4" / "Channel ipv6"。
+	bgpChannelRe = regexp.MustCompile(`^Channel\s+(ipv4|ipv6)`)
+
+	// bgpRoutesRe 从 "Routes:" 行提取 imported / exported / preferred 三个数值。
+	bgpRoutesRe = regexp.MustCompile(`^Routes:\s*(\d+)\s+imported,\s*(\d+)\s+exported,\s*(\d+)\s+preferred`)
+
+	// bgpRouteChangeRe 匹配 "Route change stats" 表格的数据行。
+	// 捕获组 1 = 方向标签（Import updates / Import withdraws / Export updates / Export withdraws），
+	// 捕获组 2-6 = 5 列数据（received, rejected, filtered, ignored, accepted）。
+	// 每个数据列可以是数字或 "---"（表示不可用）。
+	bgpRouteChangeRe = regexp.MustCompile(`^(Import (?:updates|withdraws)|Export (?:updates|withdraws)):\s+(\d+|---)\s+(\d+|---)\s+(\d+|---)\s+(\d+|---)\s+(\d+|---)\s*$`)
+
+	// birdVersionRe 匹配 BIRD 版本横幅行，如 "BIRD 2.19.2 ready."，用于跳过。
+	birdVersionRe = regexp.MustCompile(`^BIRD\s+`)
+
+	// routeChangeHeaderRe 匹配 "Route change stats:" 表头行，仅跳过用。
+	routeChangeHeaderRe = regexp.MustCompile(`^Route change stats:`)
+
+	// babelHeaderRe 匹配 Babel 邻居列表的表头行，含 "IP address" 和 "RTT"。
+	babelHeaderRe = regexp.MustCompile(`IP address.*RTT`)
+
+	// hostnameRe 从 "Hostname is <name>" 行提取主机名，捕获组 1 = 主机名。
+	hostnameRe = regexp.MustCompile(`^Hostname is\s+(.+)$`)
+)
 
 // bgpProtocol 保存单个 BGP 协议实例的解析结果。
 // 会话状态为整体，路由计数按 ipv4/ipv6 通道分开。
@@ -180,18 +217,17 @@ func parseBGPProtocols(output string) []bgpProtocol {
 	for raw := range strings.SplitSeq(output, "\n") {
 		trimmed := strings.TrimSpace(raw)
 
-		if trimmed == "" || strings.HasPrefix(trimmed, "BIRD ") {
+		if trimmed == "" || birdVersionRe.MatchString(trimmed) {
 			continue
 		}
 
 		// 检测新的 BGP 协议摘要行：<name> BGP --- ...
-		fields := strings.Fields(trimmed)
-		if len(fields) >= 3 && fields[1] == "BGP" && fields[2] == "---" {
+		if m := bgpSummaryRe.FindStringSubmatch(trimmed); m != nil {
 			if cur != nil {
 				protocols = append(protocols, *cur)
 			}
 			cur = &bgpProtocol{
-				name:     fields[0],
+				name:     m[1],
 				channels: make(map[string]*bgpChannel),
 			}
 			curCh = nil
@@ -203,47 +239,59 @@ func parseBGPProtocols(output string) []bgpProtocol {
 		}
 
 		// BGP 状态行
-		if strings.HasPrefix(trimmed, "BGP state:") {
-			parts := strings.SplitN(trimmed, ":", 2)
-			if len(parts) == 2 {
-				cur.bgpState = strings.TrimSpace(parts[1])
+		if m := bgpStateRe.FindStringSubmatch(trimmed); m != nil {
+			cur.bgpState = strings.TrimSpace(m[1])
+			continue
+		}
+
+		// Neighbor AS / Local AS 行
+		if m := bgpFieldRe.FindStringSubmatch(trimmed); m != nil {
+			n, _ := strconv.Atoi(m[2])
+			switch m[1] {
+			case "Neighbor AS":
+				cur.neighborAS = n
+			case "Local AS":
+				cur.localAS = n
 			}
 			continue
 		}
 
-		switch {
-		case strings.HasPrefix(trimmed, "Neighbor AS:"):
-			cur.neighborAS = parseIntAfterColon(trimmed)
-	
-		case strings.HasPrefix(trimmed, "Local AS:"):
-			cur.localAS = parseIntAfterColon(trimmed)
-	
-		case strings.HasPrefix(trimmed, "Channel ipv4"):
+		// Channel 行
+		if m := bgpChannelRe.FindStringSubmatch(trimmed); m != nil {
 			curCh = &bgpChannel{}
-			cur.channels["ipv4"] = curCh
-	
-		case strings.HasPrefix(trimmed, "Channel ipv6"):
-			curCh = &bgpChannel{}
-			cur.channels["ipv6"] = curCh
-	
-		case curCh != nil && strings.HasPrefix(trimmed, "Routes:"):
-			parseRouteCounts(trimmed, curCh)
-	
-		case curCh != nil && strings.HasPrefix(trimmed, "Route change stats:"):
-			// 仅表头行，数据在后续行；无需处理
+			cur.channels[m[1]] = curCh
 			continue
-	
-		case curCh != nil && strings.HasPrefix(trimmed, "Import updates:"):
-			curCh.routeChanges.ImportUpdates = parseRouteChangeDataLine(trimmed)
-	
-		case curCh != nil && strings.HasPrefix(trimmed, "Import withdraws:"):
-			curCh.routeChanges.ImportWithdraws = parseRouteChangeDataLine(trimmed)
-	
-		case curCh != nil && strings.HasPrefix(trimmed, "Export updates:"):
-			curCh.routeChanges.ExportUpdates = parseRouteChangeDataLine(trimmed)
-	
-		case curCh != nil && strings.HasPrefix(trimmed, "Export withdraws:"):
-			curCh.routeChanges.ExportWithdraws = parseRouteChangeDataLine(trimmed)
+		}
+
+		// "Route change stats:" 仅表头行，数据在后续行；无需处理
+		if curCh != nil && routeChangeHeaderRe.MatchString(trimmed) {
+			continue
+		}
+
+		// Routes 行
+		if curCh != nil {
+			if m := bgpRoutesRe.FindStringSubmatch(trimmed); m != nil {
+				curCh.imported, _ = strconv.Atoi(m[1])
+				curCh.exported, _ = strconv.Atoi(m[2])
+				curCh.preferred, _ = strconv.Atoi(m[3])
+				continue
+			}
+
+			// Route change stats 数据行
+			if m := bgpRouteChangeRe.FindStringSubmatch(trimmed); m != nil {
+				// m[1]=label, m[2..6]=5 列数据
+				vals := parseRouteChangeVals(m[2:])
+				switch m[1] {
+				case "Import updates":
+					curCh.routeChanges.ImportUpdates = vals
+				case "Import withdraws":
+					curCh.routeChanges.ImportWithdraws = vals
+				case "Export updates":
+					curCh.routeChanges.ExportUpdates = vals
+				case "Export withdraws":
+					curCh.routeChanges.ExportWithdraws = vals
+				}
+			}
 		}
 	}
 
@@ -253,62 +301,21 @@ func parseBGPProtocols(output string) []bgpProtocol {
 	return protocols
 }
 
-// parseRouteCounts 从 "Routes:" 行提取 imported / exported / preferred 三个数值。
-// 格式："Routes: 1091 imported, 14 exported, 3 preferred"
-func parseRouteCounts(line string, ch *bgpChannel) {
-	fields := strings.Fields(line)
-	if len(fields) >= 2 {
-		if v, err := strconv.Atoi(fields[1]); err == nil {
-			ch.imported = v
-		}
-	}
-	if len(fields) >= 4 {
-		if v, err := strconv.Atoi(fields[3]); err == nil {
-			ch.exported = v
-		}
-	}
-	if len(fields) >= 6 {
-		if v, err := strconv.Atoi(fields[5]); err == nil {
-			ch.preferred = v
-		}
-	}
-}
-
-// parseRouteChangeDataLine 解析 "Route change stats" 表格中的一行数据。
-// 行格式: "  Import updates:           3055          0          0        315       2740"
-// 第 1 个字段是标签（如 "Import updates:"），之后 5 个字段是数字或 "---"。
-// 返回 5 个值的数组；"---" 转换为 -1。
-func parseRouteChangeDataLine(line string) [5]int {
+// parseRouteChangeVals 将 bgpRouteChangeRe 捕获到的 5 个数据字段转为 [5]int。
+// "---" 转换为 -1（表示不可用）。
+func parseRouteChangeVals(fields []string) [5]int {
 	var vals [5]int
 	for i := range vals {
-		vals[i] = -1 // 默认不可用
+		vals[i] = -1
 	}
-	fields := strings.Fields(line)
-	// 取最后 5 个字段作为数据列，避免标签（如 "Import updates:"）被拆成多个词导致偏移
-	if len(fields) < 6 {
-		return vals
-	}
-	dataFields := fields[len(fields)-5:]
-	for i := 0; i < 5; i++ {
-		if dataFields[i] == "---" {
+	for i := 0; i < 5 && i < len(fields); i++ {
+		if fields[i] == "---" {
 			vals[i] = -1
-		} else if n, err := strconv.Atoi(dataFields[i]); err == nil {
+		} else if n, err := strconv.Atoi(fields[i]); err == nil {
 			vals[i] = n
 		}
 	}
 	return vals
-}
-
-func parseIntAfterColon(s string) int {
-	parts := strings.SplitN(s, ":", 2)
-	if len(parts) < 2 {
-		return 0
-	}
-	n, err := strconv.Atoi(strings.TrimSpace(parts[1]))
-	if err != nil {
-		return 0
-	}
-	return n
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +341,7 @@ func parseBabelNeighbors(output string) []babelNeighbor {
 
 	headerIdx := -1
 	for i, ln := range lines {
-		if strings.Contains(ln, "RTT") && strings.Contains(ln, "IP address") {
+		if babelHeaderRe.MatchString(ln) {
 			headerIdx = i
 			break
 		}
@@ -372,8 +379,8 @@ func parseBabelNeighbors(output string) []babelNeighbor {
 func parseHostname(output string) string {
 	for line := range strings.SplitSeq(output, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "Hostname is ") {
-			return strings.TrimPrefix(trimmed, "Hostname is ")
+		if m := hostnameRe.FindStringSubmatch(trimmed); m != nil {
+			return m[1]
 		}
 	}
 	return ""
