@@ -5,7 +5,7 @@ After=network.target bird.service
 
 [Service]
 Type=simple
-ExecStart=/zfspool/share/nas/code/bird_exporter/bird_exporter -token=...
+ExecStart=/usr/bin/bird_exporter -token=...
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
