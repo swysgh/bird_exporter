@@ -39,10 +39,19 @@ import (
 // 命令行参数
 // ---------------------------------------------------------------------------
 
+// 以下变量由 goreleaser 通过 -ldflags "-X main.xxx=..." 注入。
+// 默认值仅用于本地开发构建，不反映任何发布版本信息。
 var (
-	listenAddr = flag.String("listen", ":9557", "Prometheus 抓取指标的监听地址")
-	socketPath = flag.String("socket", "/var/run/bird/bird.ctl", "BIRD 控制套接字路径")
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
+var (
+	listenAddr  = flag.String("listen", ":9557", "Prometheus 抓取指标的监听地址")
+	socketPath  = flag.String("socket", "/var/run/bird/bird.ctl", "BIRD 控制套接字路径")
 	bearerToken = flag.String("token", "", "Bearer Token，留空表示不启用认证")
+	showVersion = flag.Bool("version", false, "打印版本信息并退出")
 )
 
 // bearerAuthMiddleware 包装一个 HTTP Handler，要求请求携带正确的 Bearer Token。
@@ -620,6 +629,11 @@ func boolToFloat(b bool) float64 {
 
 func main() {
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("bird_exporter %s\ncommit: %s\nbuilt at: %s\n", version, commit, date)
+		os.Exit(0)
+	}
 
 	if _, err := os.Stat(*socketPath); err != nil {
 		log.Printf("警告: BIRD 套接字 %s 不存在: %v", *socketPath, err)
