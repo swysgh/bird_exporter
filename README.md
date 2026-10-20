@@ -175,4 +175,4 @@ bird_exporter/
 
 ## 许可
 
-MIT License
+[Apache License 2.0](LICENSE) · Copyright 2026 swysgh
